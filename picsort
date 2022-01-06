@@ -1,0 +1,383 @@
+#!/bin/bash
+
+# TODO: this makes the find command easier to construct, but defaults would be better.
+set -o noglob
+
+# some globals
+REQUIRED_COMMANDS="exiftool getopt mimetype" # commands we need to operate
+
+# optional arguments
+delete_source=false             # by default, do not delete source files after copy
+dryrun=false                    # by default actually process media
+disable_mimetype=false          # by default, mimetype is used to identify media formats
+excluded_extensions=""          # if using mime type, which extensions do we want to exclude?
+extensions=""                   # which extensions to search for (if empty use mime type)
+max_filesize="10G"              # maximum filesize to copy in bytes (avoid enormous files)
+mime_pattern="(image|video)/.*" # mime types of files to process
+min_filesize="0c"               # minimum filesize to copy in bytes (avoid tiny files)
+silent=false                    # whether this script should output to stdout/stderrS
+verbose=false                   # toggle verbose output
+
+# required variables
+source_directory=""      # source directory containing media to process
+destination_directory="" # destination directory to store sorted media
+
+# output the error message and exit
+function ps_error() {
+    echo "$1"
+
+    exit 100
+}
+
+# output the error message, then usage, then exit
+function ps_usage() {
+    echo "$1"
+    echo
+    echo "picsort: [options] source [destination directory]"
+    echo
+    echo "options:"
+    echo "  --delete                                      delete source files after copying (disabled by default)"
+    echo "  -d, --dry-run                                 don't actually copy or move any files, just output what would have happened without this option"
+    echo "  -E, --exclude \"\"                              case-insensitive, space-separated list of extensions to skip (by default filename is irrelevant)"
+    echo "  -e, --extensions \"\"                           case-insensitive, space-separated list of extensions to process (by default filename is irrelevant)"
+    echo "  -h, --help                                    print this message and exit"
+    echo "  -n, --disable-mimetype                        disable mimetype checking (NOTICE: this relies only on -e and -E and by default will process ANY file)"
+    echo "  -m, --min-size 200K                           minimum filesize to process (refer to find command '-size' argument for syntax)"
+    echo "  -M, --max-size 50M                            maximum filesize to process (refer to find command '-size' argument for syntax)"
+    echo "  -t, --mimetype-pattern \"(image|video)/.*\"     mime type pattern to process (refer to 'grep -E' syntax)"
+    echo "  -s, --silent                                  output nothing, not even errors"
+    echo "  -v, --verbose                                 verbose output"
+    echo
+    echo "  source                                        source directory containing media to process"
+    echo "  destination                                   the destination directory (optional if PS_DESTDIR env var is set)"
+    echo
+
+    exit 1
+}
+
+# check for dependencies
+for cmd in $REQUIRED_COMMANDS; do
+    if [ ! -x "$(which "$cmd")" ]; then
+        ps_error "$cmd: not installed"
+    fi
+done
+
+# command line args
+if ! VALID_ARGS=$(getopt --options cde:E:hnm:M:t:sv --long delete,dry-run,extensions:,exclude:,help,min-size:,max-size:,silent,mimetype-pattern:,verbose -- "$@"); then
+    exit 1
+fi
+
+eval set -- "$VALID_ARGS"
+while :; do
+    case "$1" in
+    --delete)
+        delete_source=true
+        shift
+        ;;
+    -d | --dry-run)
+        dryrun=true
+        shift
+        ;;
+    -e | --extensions)
+        extensions=$2
+        shift 2
+        ;;
+    -E | --exclude)
+        excluded_extensions=$2
+        shift 2
+        ;;
+    -h | --help)
+        ps_usage ""
+        ;;
+    -n | --disable-mimetype)
+        disable_mimetype=true
+        shift
+        ;;
+    -m | --min-size)
+        min_filesize=$2
+        shift 2
+        ;;
+    -M | --max-size)
+        max_filesize=$2
+        shift 2
+        ;;
+    -s | --silent)
+        silent=true
+        vecho=":"
+        shift
+        ;;
+    -t | --mimetype-pattern)
+        mime_pattern=$2
+        shift 2
+        ;;
+    -v | --verbose)
+        verbose=true
+        silent=false
+        shift
+        ;;
+    --)
+        shift
+        break
+        ;;
+    *)
+        ps_usage "unrecognized option: $1"
+        ;;
+    esac
+done
+
+# toggle verbose output (handle this one early as possible, so it can be used)
+if $verbose; then
+    vecho="echo"
+else
+    vecho=":"
+fi
+
+# normal echo, for normal output
+if $silent; then
+    necho=":"
+else
+    necho="echo"
+fi
+
+$vecho "delete_source       : $delete_source"
+$vecho "dryrun              : $dryrun"
+$vecho "disable_mimetype    : $disable_mimetype"
+$vecho "extensions          : $extensions"
+$vecho "excluded_extensions : $excluded_extensions"
+$vecho "max_filesize        : $max_filesize"
+$vecho "mime_pattern        : $mime_pattern"
+$vecho "min_filesize        : $min_filesize"
+$vecho "silent              : $silent"
+
+# parse the non-option arguments (the validation in this section is weak)
+if [ ${#@} -lt 1 ] || [ ${#@} -gt 2 ]; then
+    ps_usage "invalid number of arguments"
+else
+    # check for a valid input location
+    if [ -e "$1" ]; then
+        source_directory="$1"
+    else
+        ps_error "input location: $1 does not exist"
+    fi
+
+    # check for a valid output location
+    if [ "" == "$2" ]; then
+        # no argument given, try to use env var
+        if [ "" != "$PS_DESTDIR" ]; then
+            destination_directory="$PS_DESTDIR"
+        else
+            ps_usage "no outdir specified"
+        fi
+    else
+        destination_directory="$2"
+    fi
+
+    if ! [ -d "$destination_directory" ] && [ -w "$destination_directory" ]; then
+        ps_error "specified outdir is either not a directory, or is not writeable"
+    fi
+fi
+
+$vecho "source_directory    : $source_directory"
+$vecho "output_dir          : $destination_directory"
+
+# make the dry run output more obvious
+if $delete_source; then
+    dryrun_command="move"
+else
+    dryrun_command="copy"
+fi
+
+# toggle dryrun output when specified, or when verbose
+if $dryrun || $verbose; then
+    dryrun_echo="echo"
+else
+    dryrun_echo=":"
+fi
+
+# build the list of matching files using find
+$vecho -n "generating file list..."
+
+# non-destructively set the field separator to newline for processing of the list
+ORIGIFS=$IFS
+IFS=$','
+
+# generate extension matching criteria
+if [ "" != "$extensions" ]; then
+    i=1
+    extensions_count=$((1 + $(awk '{print gsub(/,/, "")}' <<<"$extensions")))
+
+    if [ ${#extensions} -gt 1 ]; then
+        extensions_string="( "
+    fi
+
+    for ext in $extensions; do
+        i=$((i + 1))
+        extensions_string+="-iname *.$ext "
+
+        if [ $i -le $extensions_count ]; then
+            extensions_string+="-o "
+        fi
+    done
+
+    if [ ${#extensions} -gt 1 ]; then
+        extensions_string+=" )"
+    fi
+else
+    extensions_string=""
+fi
+
+# generate extension omission criteria
+if [ "" != "$excluded_extensions" ]; then
+    i=1
+    excluded_extensions_count=$((1 + $(awk '{print gsub(/,/, "")}' <<<"$excluded_extensions")))
+
+    for ext in $excluded_extensions; do
+        i=$((i + 1))
+        excluded_extensions_string+="-not -iname *.$ext "
+
+        if [ $i -le $excluded_extensions_count ]; then
+            excluded_extensions_string+="-a "
+        fi
+    done
+else
+    excluded_extensions_string=""
+fi
+
+# if both a list of extensions and a list of excluded extensions are provided, we have to 'and' them
+if [ "" != "$extensions" ] && [ "" != "$excluded_extensions" ]; then
+    # we need to include the spaces here so the string can be totally empty if neither are specified
+    and_string=" -a "
+else
+    and_string=""
+fi
+
+IFS=$ORIGIFS
+
+# combine it all
+extension_match="$extensions_string$and_string$excluded_extensions_string"
+
+# TODO: this should just be constructed as a string, not two paths like this
+# TODO: there's a way to handle this but i can't recall: $extension_match is left unquoted and globbing disabled above because if extension_match is empty, '' is inserted, messing up the find command
+# TODO: if no size limits are set, the -size arguments should be omitted
+if $disable_mimetype; then
+    file_list=$(find "$source_directory" -type f -size +"$min_filesize" -size -"$max_filesize" $extension_match -print)
+else
+    file_list=$(find "$source_directory" -type f -size +"$min_filesize" -size -"$max_filesize" $extension_match -exec sh -c "for f do mimetype -b \$f | grep -Eq '$mime_pattern' && echo \$f; done" sh {} +)
+fi
+
+# TODO: this produces 1 when there are 0 matches
+$vecho "done. ($(awk 'END{print NR}' <<<"$file_list") matching files)"
+
+# non-destructively set the field separator to newline for processing of the list
+ORIGIFS=$IFS
+IFS=$'\n'
+
+$vecho "processing files..."
+for file in $file_list; do
+    filename=$(basename "$file")
+
+    # TODO: regex should be updated to match YYYYMMDD with no delimiter
+    if [ "" != "$(grep -Eo "[0-9]{4}[\.,\:,\-][0-9]{2}[\.,\:,\-][0-9]{2}" <<<"$filename")" ]; then
+        filename_datestamp="$(head -n 1 <<<"$(grep -Eo "[0-9]{4}[\.,\:,\-][0-9]{2}[\.,\:,\-][0-9]{2}" <<<"$filename")") 00:00:00"
+        filename_datestamp=${filename_datestamp//-/:}
+        filename_datestamp=${filename_datestamp//./:}
+    else
+        filename_datestamp=""
+    fi
+
+    exif_data=$(exiftool -q -q -j "$file")
+
+    # TODO: turn this into a loop through a prioritized list of field names
+
+    # seems to be preferred
+    exif_DateTimeOriginal=$(jq -r .[0].DateTimeOriginal <<<"$exif_data")
+
+    # seems not as good as DateTimeOriginal?
+    exif_DateCreated=$(jq -r .[0].DateCreated <<<"$exif_data")
+
+    # seems not as good as DateTimeOriginal?
+    exif_CreateDate=$(jq -r .[0].CreateDate <<<"$exif_data")
+
+    # last resort
+    exif_NoDate="0000:00:00 00:00:00"
+
+    if [ "null" != "$exif_DateTimeOriginal" ]; then
+        datestamp=$exif_DateTimeOriginal
+    else
+        if [ "null" != "$exif_DateCreated" ]; then
+            datestamp=$exif_DateCreated
+        else
+            if [ "null" != "$exif_CreateDate" ]; then
+                datestamp=$exif_CreateDate
+            else
+                if [ "" != "$filename_datestamp" ]; then
+                    datestamp="$filename_datestamp"
+                else
+                    datestamp=$exif_NoDate
+                fi
+            fi
+        fi
+    fi
+
+    datestamp_year=$(cut -d\: -f1 <<<"$datestamp")
+    datestamp_month=$(cut -d\: -f2 <<<"$datestamp")
+    datestamp_day=$(cut -d\: -f3 <<<"$(cut -d \  -f1 <<<"$datestamp")")
+
+    dupskip=false
+
+    # detect duplicates with the same name (even if it's a dry run)
+    if [ -e "$destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day/$filename" ]; then
+        source_md5=$(cut -d\  -f1 <<<"$(md5sum "$file")")
+        dest_md5=$(cut -d\  -f1 <<<"$(md5sum "$destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day/$filename")")
+
+        if [ "$source_md5" == "$dest_md5" ]; then
+            dupskip=true
+        else
+            filename="$source_md5-$filename"
+        fi
+    fi
+
+    # make the destination directory before copying if it doesn't exist
+    if [ ! -d "$destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day" ]; then
+        mkdir -p "$destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day"
+    fi
+
+    # do the thing
+    # TODO: simplify this section, maybe a function?
+    if $dryrun; then
+        if $dupskip; then
+            $dryrun_echo "  [dryrun] dupskip $file ($datestamp_year-$datestamp_month-$datestamp_day)"
+        else
+            # make the destination directory before copying if it doesn't exist
+            if [ ! -d "$destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day" ]; then
+                $dryrun_echo " [dryrun] create directory: $destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day"
+            fi
+
+            $dryrun_echo "  [dryrun] $dryrun_command $file -> $destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day/$filename"
+        fi
+    else
+        if $dupskip; then
+            $necho "  dupskip $file ($datestamp_year-$datestamp_month-$datestamp_day)"
+        else
+            # make the destination directory before copying if it doesn't exist
+            if [ ! -d "$destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day" ]; then
+                $necho "create $destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day"
+
+                mkdir -p "$destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day"
+            fi
+
+            $necho "  $file ($datestamp_year-$datestamp_month-$datestamp_day)"
+            cp "$file" "$destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day/$filename"
+        fi
+    fi
+
+    # TODO: this could also detect if the directory the file came from is now empty and also delete that.
+    #if $delete_source; then
+    #    rm -f "$file"
+    #fi
+done
+
+$vecho "finished processing files."
+
+# return the field separator to default
+IFS=$ORIGIFS
