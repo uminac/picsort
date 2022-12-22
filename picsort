@@ -339,7 +339,10 @@ for file in $file_list; do
 
     # make the destination directory before copying if it doesn't exist
     if [ ! -d "$destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day" ]; then
-        mkdir -p "$destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day"
+        if ! mkdir -p "$destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day"; then
+            $necho "error: could not create directory: $destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day"
+            exit 1
+        fi
     fi
 
     # do the thing
@@ -367,14 +370,24 @@ for file in $file_list; do
             fi
 
             $necho "  $file ($datestamp_year-$datestamp_month-$datestamp_day)"
-            cp "$file" "$destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day/$filename"
+            if ! cp "$file" "$destination_directory/$datestamp_year/$datestamp_year-$datestamp_month-$datestamp_day/$filename"; then
+                $necho "  [error] failed to copy $file"
+                exit 1
+            fi
         fi
     fi
 
     # TODO: this could also detect if the directory the file came from is now empty and also delete that.
-    #if $delete_source; then
-    #    rm -f "$file"
-    #fi
+    if $dryrun; then
+        if $delete_source; then
+            $dryrun_echo "  [dryrun] delete $file"
+        fi
+    else
+        if $delete_source; then
+            $necho "  delete $file"
+            rm -f "$file"
+        fi
+    fi
 done
 
 $vecho "finished processing files."
